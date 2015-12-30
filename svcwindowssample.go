@@ -159,7 +159,7 @@ func runService(name string, isDebug bool) {
 	if isDebug {
 		run = debug.Run
 	}
-	err = run(name, &apiserv{&elog,name})
+	err = run(name, &APIServ{&elog,name})
 	if err != nil {
 		elog.Error(1, fmt.Sprintf("%s service failed: %v", name, err))
 		return
@@ -167,26 +167,47 @@ func runService(name string, isDebug bool) {
 	elog.Info(1, fmt.Sprintf("%s service stopped", name))
 }
 
-type apiservestatus struct {
+type APIServeStatus struct {
 	l sync.RWMutex
 	run bool
+	stopped bool
+	err error
 }
-func (as *apiservestatus) GetRun() (bool) {
+func (as *APIServeStatus) GetRun() (bool) {
 	as.l.RLock()
 	defer as.l.RUnlock()
 	return as.run
 }
-func (as *apiservestatus) SetRun(run bool)  {
+func (as *APIServeStatus) SetRun(run bool)  {
 	as.l.Lock()
 	defer as.l.Unlock()
-	as.run = false
+	as.run = run
 }
 
-type apiservehttp struct {
-	as * apiservestatus
+func (as *APIServeStatus) GetStopped() (bool) {
+	as.l.RLock()
+	defer as.l.RUnlock()
+	return as.stopped
+}
+func (as *APIServeStatus) GetError() (error) {
+	as.l.RLock()
+	defer as.l.RUnlock()
+	return as.err
+}
+func (as *APIServeStatus) SetStopped(stopped bool,err error)  {
+	as.l.Lock()
+	defer as.l.Unlock()
+	as.stopped = stopped
+	if err != nil {
+		as.err = err
+	}	
 }
 
-func (ah *apiservehttp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+type APIServeHTTP struct {
+	as * APIServeStatus
+}
+
+func (ah *APIServeHTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	status := *(ah.as)
 	w.Header().Set("Content-Type", "text/xml")
 	if status.GetRun() {
@@ -195,52 +216,80 @@ func (ah *apiservehttp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "<?xml version='1.0' encoding='UTF-8'?><response><state>Stop</state></response>")
 	}
 }
-
-type apiserv struct{
+type APIServ struct{
 	elog *debug.Log
 	name string
 }
 
-func (s *apiserv) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
+func (s *APIServ) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
 	elog := (*s.elog)
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPauseAndContinue
 	changes <- svc.Status{State: svc.StartPending}
 	
-	as := apiservestatus{run:true}
-	server := manners.NewWithServer(&http.Server{Addr: ":14487", Handler: &apiservehttp{&as}})
+	port := 14487
 	
-	go func(server *manners.GracefulServer) {
-		server.ListenAndServe()
-	}(server)
-	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
+	as := APIServeStatus{run:true,stopped:false}
+	server := manners.NewWithServer(&http.Server{Addr: fmt.Sprintf(":%d",port), Handler: &APIServeHTTP{&as}})
 	
-	tick := time.Tick(5 * time.Second)
-	service:
-	for {
-		select {
-			case c := <-r:
-				switch c.Cmd {
-					case svc.Interrogate:
-						changes <- c.CurrentStatus
-					case svc.Stop, svc.Shutdown:
-						as.SetRun(false)
-						elog.Error(1,"Stopping")
-						break service
-					case svc.Pause:
-					case svc.Continue:
-					default:
-						elog.Error(1, fmt.Sprintf("unexpected control request #%d", c))
-				}
-			case <-tick:
-				elog.Info(1, "Alive")
+	go func(server *manners.GracefulServer,as *APIServeStatus) {
+		err := server.ListenAndServe()
+		if err != nil {
+			as.SetStopped(true,err)
 		}
+	}(server,&as)
+	
+	//self testing
+	selfurl := fmt.Sprintf("http://localhost:%d",port)
+	time.Sleep(100 * time.Millisecond)
+	elog.Info(1,fmt.Sprintf("Trying first selftest"))
+	_, selferr := http.Get(selfurl)
+	for test := 5;test > 0 && selferr != nil;test--  {
+		time.Sleep(100 * time.Millisecond)
+		elog.Info(1,fmt.Sprintf("Trying selftest %d",test))
+		_, selferr = http.Get(selfurl)
+	}
+	
+	if selferr == nil &&  as.GetStopped() == false {
+		changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
+		elog.Info(1,"Service gave no error so far and self test was able to get main page")
+		tick := time.Tick(1 * time.Second)
+		service:
+		for {
+			select {
+				case c := <-r:
+					switch c.Cmd {
+						case svc.Interrogate:
+							changes <- c.CurrentStatus
+						case svc.Stop, svc.Shutdown:
+							as.SetRun(false)
+							elog.Error(1,"Stopping")
+							break service
+						case svc.Pause:
+						case svc.Continue:
+						default:
+							elog.Error(1, fmt.Sprintf("unexpected control request #%d", c))
+					}
+				case <-tick:
+					if as.GetStopped() {
+						elog.Error(1,"Service failed")
+						as.SetRun(false)
+						break service
+					}
+			}
+		}
+	} else {
+		as.SetStopped(true,selferr)
 	}
 	changes <- svc.Status{State: svc.StopPending}
-	elog.Info(1,"Sleeping 5 seconds for finishing off calls")
-	time.Sleep(5 * time.Second)
-	elog.Info(1,"Sleeping with manners")
-	server.BlockingClose()
-	elog.Info(1,"Done")
+	if !as.GetStopped() {
+		elog.Info(1,"Sleeping 5 seconds for finishing off calls")
+		time.Sleep(5 * time.Second)
+		elog.Info(1,"Sleeping with manners")
+		server.BlockingClose()
+		elog.Info(1,"Done")
+	}  else if lerr := as.GetError(); lerr != nil {
+		elog.Error(1,fmt.Sprintf("Error %s",lerr))
+	}
 	return
 }
 
