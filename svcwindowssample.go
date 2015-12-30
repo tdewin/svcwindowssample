@@ -265,7 +265,11 @@ func (s *APIServ) Execute(args []string, r <-chan svc.ChangeRequest, changes cha
 							elog.Error(1,"Stopping")
 							break service
 						case svc.Pause:
+							as.SetRun(false)
+							changes <- svc.Status{State: svc.Paused, Accepts: cmdsAccepted}
 						case svc.Continue:
+							as.SetRun(true)
+							changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 						default:
 							elog.Error(1, fmt.Sprintf("unexpected control request #%d", c))
 					}
